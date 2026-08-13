@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""ultra-map — one-shot repository orientation.
+
+Usage: ultra-map [path] [--json] [--quiet]
+
+Prints a decision-ready map: scale, stack, workspace layout, the real
+build/test/lint commands with provenance, entry points, churn, and the
+traps that make later searches lie.
+
+Command provenance is the point. A command learned from CI has to work;
+one read off a manifest might. One inferred from the toolchain is a guess.
+Each is labelled, so an agent knows what it may assert.
+
+Stdlib only.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
+SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "env", "__pycache__", "dist",
+    "build", "target", "vendor", ".next", ".nuxt", ".cache", ".tox", "coverage",
+    ".idea", ".vscode", ".terraform", "Pods", "DerivedData", ".gradle",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", "bower_components", ".svn",
+}
+# Directories that exist in the tree but whose contents are not authored here.
+# Every later search must exclude them or its counts are fiction.
+NOISE_MARKERS = (
+    "node_modules", "vendor", "third_party", "3rdparty", "generated", "gen",
+    "__generated__", ".pb.go", "_pb2.py", ".g.dart", "migrations",
+)
+LANG_BY_EXT = {
+    ".py": "Python", ".rs": "Rust", ".go": "Go", ".ts": "TypeScript",
+    ".tsx": "TypeScript", ".js": "JavaScript", ".jsx": "JavaScript",
+    ".java": "Java", ".kt": "Kotlin", ".rb": "Ruby", ".php": "PHP",
+    ".c": "C", ".h": "C/C++ header", ".cc": "C++", ".cpp": "C++", ".hpp": "C++",
+    ".cs": "C#", ".swift": "Swift", ".scala": "Scala", ".ex": "Elixir",
+    ".exs": "Elixir", ".erl": "Erlang", ".clj": "Clojure", ".hs": "Haskell",
+    ".lua": "Lua", ".sh": "Shell", ".bash": "Shell", ".zig": "Zig",
+    ".dart": "Dart", ".m": "Objective-C", ".asm": "Assembly", ".s": "Assembly",
+    ".sql": "SQL", ".proto": "Protobuf",
+}
+CI_PATHS = [
+    ".github/workflows", ".gitlab-ci.yml", ".circleci/config.yml", "Jenkinsfile",
+    "azure-pipelines.yml", ".travis.yml", "bitbucket-pipelines.yml", ".drone.yml",
+    "Earthfile", ".buildkite/pipeline.yml",
+]
+CMD_WORDS = re.compile(
+    r"\b(test|tests|build|lint|check|fmt|format|typecheck|type-check|tsc|pytest|"
+    r"cargo|clippy|go\s|golangci|npm|pnpm|yarn|bun|make|mvn|gradle|tox|nox|ruff|"
+    r"eslint|mypy|pyright|rspec|phpunit|dotnet|swift|mix|rebar3|bazel|ninja|cmake)\b")
+
+results = {"commands": [], "flags": []}
+
+
+def sh(cmd, cwd, timeout=15):
+    try:
+        r = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def read(path, limit=400_000):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
+    except OSError:
+        return ""
+
+
+def load_toml(path):
+    raw = read(path)
+    if not raw:
+        return {}
+    if tomllib:
+        try:
+            return tomllib.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
+def add_cmd(kind, command, source, confidence):
+    """confidence: verified-by-ci | declared | inferred"""
+    command = " ".join(str(command).split())
+    if not command:
+        return
+    for c in results["commands"]:
+        if c["command"] == command:
+            # CI provenance always wins: those commands have to work.
+            if confidence == "verified-by-ci" and c["confidence"] != "verified-by-ci":
+                c.update(kind=kind, source=source, confidence=confidence)
+            return
+    results["commands"].append(
+        {"kind": kind, "command": command, "source": source, "confidence": confidence})
+
+
+def walk(root):
+    files, skipped = [], 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        pruned = [d for d in dirnames if d in SKIP_DIRS or (d.startswith(".") and d != ".github")]
+        skipped += len(pruned)
+        dirnames[:] = [d for d in dirnames if d not in pruned]
+        for f in filenames:
+            files.append(os.path.relpath(os.path.join(dirpath, f), root))
+        if len(files) > 300_000:
+            results["flags"].append("file walk truncated at 300k files")
+            break
+    return files, skipped
+
+
+# ------------------------------------------------------------------ commands --
+def from_ci(root):
+    found_any = False
+    targets = []
+    wf = os.path.join(root, ".github", "workflows")
+    if os.path.isdir(wf):
+        try:
+            targets += [os.path.join(wf, f) for f in sorted(os.listdir(wf))
+                        if f.endswith((".yml", ".yaml"))][:8]
+        except OSError:
+            pass
+    for rel in CI_PATHS[1:]:
+        p = os.path.join(root, rel)
+        if os.path.isfile(p):
+            targets.append(p)
+    for path in targets:
+        body = read(path)
+        if not body:
+            continue
+        found_any = True
+        rel = os.path.relpath(path, root)
+        # `run:` blocks in GitHub/GitLab style, plus bare `- cmd` script entries
+        for block in re.findall(r"(?:run|script):\s*\|?\s*\n((?:[ \t]+.+\n?)+)|(?:run|script):[ \t]*(.+)",
+                                body):
+            chunk = block[0] or block[1] or ""
+            for line in chunk.splitlines():
+                line = line.strip().lstrip("- ").strip()
+                if not line or line.startswith("#") or len(line) > 200:
+                    continue
+                if CMD_WORDS.search(line):
+                    add_cmd(classify(line), line, rel, "verified-by-ci")
+    return found_any
+
+
+def classify(cmd):
+    c = cmd.lower()
+    if re.search(r"\b(fmt|format|prettier|black|rustfmt|gofmt)\b", c):
+        return "format"
+    if re.search(r"\b(tsc|mypy|pyright|typecheck|type-check)\b", c):
+        return "typecheck"
+    if re.search(r"\b(lint|clippy|eslint|ruff|golangci|vet)\b", c):
+        return "lint"
+    if re.search(r"\btest|pytest|rspec|phpunit|jest|vitest\b", c):
+        return "test"
+    if re.search(r"\b(build|compile|bundle|make)\b", c):
+        return "build"
+    if re.search(r"\bcheck\b", c):
+        return "check"
+    return "other"
+
+
+MAKE_KINDS = {
+    "test": "test", "tests": "test", "check": "check", "build": "build",
+    "all": "build", "compile": "build", "lint": "lint", "fmt": "format",
+    "format": "format", "typecheck": "typecheck", "run": "run", "dev": "run",
+    "install": "install", "clean": "clean", "bench": "bench", "doc": "docs",
+    "docs": "docs", "release": "build", "debug": "build",
+}
+
+
+def from_manifests(root, files):
+    top = {f for f in files if f.count(os.sep) == 0}
+
+    # -- Makefile: real targets beat guessed ones
+    for mk in ("Makefile", "makefile", "GNUmakefile"):
+        if mk in top:
+            body = read(os.path.join(root, mk))
+            targets = []
+            for m in re.finditer(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:(?!=)", body, re.M):
+                t = m.group(1)
+                if t not in targets:
+                    targets.append(t)
+            results["makeTargets"] = targets[:40]
+            for t in targets:
+                kind = MAKE_KINDS.get(t.lower())
+                if kind and kind not in ("clean", "install"):
+                    add_cmd(kind, f"make {t}", mk, "declared")
+            break
+
+    # -- Node
+    if "package.json" in top:
+        try:
+            pkg = json.loads(read(os.path.join(root, "package.json")) or "{}")
+        except Exception:
+            pkg = {}
+        pm = "npm"
+        if "pnpm-lock.yaml" in top:
+            pm = "pnpm"
+        elif "yarn.lock" in top:
+            pm = "yarn"
+        elif "bun.lockb" in top or "bun.lock" in top:
+            pm = "bun"
+        results["packageManager"] = pm
+        run = f"{pm} run" if pm != "npm" else "npm run"
+        for name, script in (pkg.get("scripts") or {}).items():
+            kind = classify(name + " " + str(script))
+            if kind != "other" or name in ("dev", "start"):
+                add_cmd(kind, f"{run} {name}", "package.json", "declared")
+        if pkg.get("workspaces"):
+            results["workspaces"] = {"kind": f"{pm} workspaces",
+                                     "globs": pkg["workspaces"]}
+    if "pnpm-workspace.yaml" in top:
+        results.setdefault("workspaces", {"kind": "pnpm workspace", "globs": []})
+
+    # -- Rust
+    if "Cargo.toml" in top:
+        data = load_toml(os.path.join(root, "Cargo.toml"))
+        ws = data.get("workspace")
+        if ws is not None:
+            members = ws.get("members") or []
+            results["workspaces"] = {"kind": "cargo workspace", "globs": members}
+            if not members:
+                results["flags"].append(
+                    "Cargo.toml declares a workspace with zero members — cargo "
+                    "commands here build nothing. The Rust build is either "
+                    "unfinished or driven entirely by the Makefile")
+        add_cmd("check", "cargo check --all-targets", "Cargo.toml", "inferred")
+        add_cmd("test", "cargo test", "Cargo.toml", "inferred")
+        add_cmd("build", "cargo build", "Cargo.toml", "inferred")
+        add_cmd("lint", "cargo clippy --all-targets -- -D warnings", "Cargo.toml", "inferred")
+        add_cmd("format", "cargo fmt --check", "Cargo.toml", "inferred")
+
+    # -- Python
+    if "pyproject.toml" in top:
+        data = load_toml(os.path.join(root, "pyproject.toml"))
+        raw = read(os.path.join(root, "pyproject.toml"))
+        tool = data.get("tool") or {}
+        blob = (raw or "").lower()
+        if "pytest" in blob or "pytest" in tool:
+            add_cmd("test", "pytest", "pyproject.toml", "declared")
+        if "ruff" in blob or "ruff" in tool:
+            add_cmd("lint", "ruff check .", "pyproject.toml", "declared")
+        if "mypy" in blob or "mypy" in tool:
+            add_cmd("typecheck", "mypy .", "pyproject.toml", "declared")
+        if "black" in blob:
+            add_cmd("format", "black --check .", "pyproject.toml", "declared")
+        if "poetry" in tool:
+            results["packageManager"] = "poetry"
+        elif "uv" in blob:
+            results["packageManager"] = "uv"
+        if not any(c["kind"] == "test" for c in results["commands"]):
+            add_cmd("test", "pytest", "pyproject.toml", "inferred")
+    elif any(f in top for f in ("setup.py", "requirements.txt", "tox.ini", "noxfile.py")):
+        if "tox.ini" in top:
+            add_cmd("test", "tox", "tox.ini", "declared")
+        elif "noxfile.py" in top:
+            add_cmd("test", "nox", "noxfile.py", "declared")
+        else:
+            add_cmd("test", "pytest", "python project", "inferred")
+
+    # -- Go
+    if "go.mod" in top:
+        add_cmd("build", "go build ./...", "go.mod", "inferred")
+        add_cmd("test", "go test ./...", "go.mod", "inferred")
+        add_cmd("lint", "go vet ./...", "go.mod", "inferred")
+    if "go.work" in top:
+        results["workspaces"] = {"kind": "go workspace", "globs": []}
+
+    # -- JVM
+    if "pom.xml" in top:
+        add_cmd("test", "mvn -q test", "pom.xml", "inferred")
+        add_cmd("build", "mvn -q package", "pom.xml", "inferred")
+    if any(f.startswith("build.gradle") for f in top):
+        g = "./gradlew" if "gradlew" in top else "gradle"
+        add_cmd("test", f"{g} test", "build.gradle", "inferred")
+        add_cmd("build", f"{g} build", "build.gradle", "inferred")
+
+    # -- others
+    if "Gemfile" in top:
+        add_cmd("test", "bundle exec rspec", "Gemfile", "inferred")
+    if "mix.exs" in top:
+        add_cmd("test", "mix test", "mix.exs", "inferred")
+    if "composer.json" in top:
+        add_cmd("test", "vendor/bin/phpunit", "composer.json", "inferred")
+    if "CMakeLists.txt" in top:
+        add_cmd("build", "cmake -B build && cmake --build build", "CMakeLists.txt", "inferred")
+    if "Dockerfile" in top:
+        results.setdefault("containers", []).append("Dockerfile")
+    for f in ("docker-compose.yml", "docker-compose.yaml", "compose.yaml"):
+        if f in top:
+            results.setdefault("containers", []).append(f)
+
+
+# -------------------------------------------------------------------- report --
+def main():
+    argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    as_json = "--json" in sys.argv
+    root = os.path.abspath(argv[0] if argv else ".")
+    if not os.path.isdir(root):
+        sys.exit(f"ultra-map: not a directory: {root}")
+
+    files, _ = walk(root)
+    results["root"] = root
+    results["fileCount"] = len(files)
+
+    ext = Counter(os.path.splitext(f)[1].lower() for f in files if os.path.splitext(f)[1])
+    langs = Counter()
+    for e, n in ext.items():
+        if e in LANG_BY_EXT:
+            langs[LANG_BY_EXT[e]] += n
+    results["languages"] = dict(langs.most_common(10))
+    results["extensions"] = dict(ext.most_common(15))
+
+    has_ci = from_ci(root)
+    from_manifests(root, files)
+    results["ciPresent"] = has_ci
+
+    manifests = sorted(f for f in files if os.path.basename(f) in {
+        "package.json", "pyproject.toml", "setup.py", "requirements.txt", "go.mod",
+        "Cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile",
+        "composer.json", "mix.exs", "Makefile", "CMakeLists.txt", "flake.nix",
+    } and f.count(os.sep) <= 2)
+    results["manifests"] = manifests[:30]
+
+    level1 = Counter(f.split(os.sep)[0] for f in files)
+    results["skeleton"] = [{"dir": d, "files": n} for d, n in level1.most_common(25)]
+
+    noisy = sorted({f.split(os.sep)[0] for f in files
+                    if any(m in f.lower() for m in NOISE_MARKERS)})
+    if noisy:
+        results["noiseZones"] = noisy[:15]
+
+    # Entry points: conventional names, then a bounded content scan. Name-only
+    # detection misses the entry point that does not follow convention, which is
+    # exactly the one worth knowing about.
+    hits = []
+    for name in ("main.py", "app.py", "__main__.py", "manage.py", "index.ts",
+                 "index.js", "main.go", "src/main.rs", "src/index.ts", "src/main.py",
+                 "src/lib.rs", "main.c", "Program.cs"):
+        if os.path.exists(os.path.join(root, name)):
+            hits.append(name)
+
+    MAIN_SIGNS = [
+        (".py", re.compile(r"^if\s+__name__\s*==\s*['\"]__main__['\"]", re.M)),
+        (".go", re.compile(r"^func\s+main\s*\(", re.M)),
+        (".rs", re.compile(r"^(pub\s+)?fn\s+main\s*\(", re.M)),
+        (".java", re.compile(r"public\s+static\s+void\s+main\s*\(")),
+        (".kt", re.compile(r"^fun\s+main\s*\(", re.M)),
+        (".c", re.compile(r"^\s*int\s+main\s*\(", re.M)),
+        (".cpp", re.compile(r"^\s*int\s+main\s*\(", re.M)),
+        (".cc", re.compile(r"^\s*int\s+main\s*\(", re.M)),
+        (".cs", re.compile(r"static\s+(async\s+)?(void|int|Task)\s+Main\s*\(")),
+        (".rb", re.compile(r"^if\s+__FILE__\s*==\s*\$0", re.M)),
+    ]
+    signs = dict(MAIN_SIGNS)
+    scanned = 0
+    for f in files:
+        if scanned >= 3000 or len(hits) >= 25:
+            break
+        rx = signs.get(os.path.splitext(f)[1].lower())
+        if not rx or f in hits:
+            continue
+        full = os.path.join(root, f)
+        try:
+            if os.path.getsize(full) > 400_000:
+                continue
+        except OSError:
+            continue
+        scanned += 1
+        if rx.search(read(full, 20_000)):
+            hits.append(f)
+    results["entryPoints"] = hits[:25]
+
+    is_git = os.path.isdir(os.path.join(root, ".git"))
+    results["git"] = is_git
+    if is_git:
+        churn = sh("git log --format= --name-only -n 2000 2>/dev/null | grep -v '^$' "
+                   "| sort | uniq -c | sort -rn | head -12", root, timeout=25)
+        results["churn"] = [l.strip() for l in churn.splitlines() if l.strip()]
+        results["branch"] = sh("git rev-parse --abbrev-ref HEAD", root).strip()
+        dirty = sh("git status --porcelain", root)
+        results["dirtyFiles"] = len([l for l in dirty.splitlines() if l.strip()])
+    else:
+        results["flags"].append(
+            "not a git repository — no history, no blame, and no git-based rollback "
+            "if a change goes wrong")
+
+    docs = [n for n in ("CLAUDE.md", "AGENTS.md", "README.md", "CONTRIBUTING.md",
+                        "CODEOWNERS", ".github/CODEOWNERS", "docs/adr",
+                        "docs/architecture", ".editorconfig", ".pre-commit-config.yaml")
+            if os.path.exists(os.path.join(root, n))]
+    results["bindingDocs"] = docs
+
+    if not has_ci:
+        results["flags"].append(
+            "no CI config — every command below is declared or inferred, never "
+            "proven. Run one before asserting it works")
+    if not any(c["kind"] == "test" for c in results["commands"]):
+        results["flags"].append("no test command found by any route — ask before assuming one")
+    if len(langs) >= 4:
+        results["flags"].append(
+            f"{len(langs)} languages present — a command that works in one part of "
+            "this tree may not apply to another")
+
+    if as_json:
+        print(json.dumps(results, indent=2))
+        return
+
+    def sec(t):
+        print(f"\n== {t} ==")
+
+    print(f"ultra-map: {root}")
+    sec("scale")
+    print(f"files: {len(files)}   languages: " +
+          (", ".join(f"{k} {v}" for k, v in langs.most_common(6)) or "none detected"))
+    if results.get("workspaces"):
+        w = results["workspaces"]
+        print(f"workspace: {w['kind']}  {w.get('globs') or ''}")
+    if results.get("packageManager"):
+        print(f"package manager: {results['packageManager']}")
+
+    sec("commands")
+    if results["commands"]:
+        order = {"verified-by-ci": 0, "declared": 1, "inferred": 2}
+        for c in sorted(results["commands"], key=lambda c: (order.get(c["confidence"], 9), c["kind"])):
+            tag = {"verified-by-ci": "CI      ", "declared": "declared",
+                   "inferred": "inferred"}[c["confidence"]]
+            print(f"  [{tag}] {c['kind']:9s} {c['command']}   ({c['source']})")
+        print("\n  CI = has to work.  declared = the project says so.  "
+              "inferred = from the toolchain, unproven.")
+    else:
+        print("  none found — ask the user for the build/test commands")
+
+    if results.get("makeTargets"):
+        sec("make targets")
+        print("  " + "  ".join(results["makeTargets"][:20]))
+
+    sec("manifests")
+    print("\n".join(f"  {m}" for m in manifests[:20]) or "  (none near root)")
+
+    sec("skeleton")
+    for row in results["skeleton"][:18]:
+        mark = "  <- noise" if row["dir"] in (results.get("noiseZones") or []) else ""
+        print(f"  {row['dir']:32s} {row['files']:6d}{mark}")
+
+    sec("entry points")
+    print("\n".join(f"  {h}" for h in hits[:15]) or "  (none detected)")
+
+    if results.get("churn"):
+        sec("churn (top files, last 2000 commits)")
+        print("\n".join(f"  {c}" for c in results["churn"][:10]))
+
+    sec("binding docs")
+    print("\n".join(f"  {d}" for d in docs) or "  (none)")
+
+    if results["flags"]:
+        sec("flags")
+        for f in results["flags"]:
+            print(f"  ! {f}")
+
+
+if __name__ == "__main__":
+    main()

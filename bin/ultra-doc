@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""ultra-doc — extract text from documents, with honest failure.
+
+Usage:
+  ultra-doc <file> [--pages N-M] [--max-chars N]
+  ultra-doc --inventory <dir>
+
+Handles PDF, xlsx/xlsm, docx, pptx, csv, ipynb, and plain text. Reports
+what it could NOT extract rather than emitting plausible-looking nothing:
+a scanned PDF returns an explicit diagnosis, never silence.
+
+Stdlib only, except where a richer library happens to be installed
+(openpyxl, python-docx) — degrades to zip/XML parsing otherwise.
+"""
+import csv as csvmod
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+
+MAX_CHARS = 200_000
+
+
+def die(msg):
+    print(f"ultra-doc: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def note(msg):
+    print(f"[ultra-doc] {msg}", file=sys.stderr)
+
+
+def strip_xml(xml: str) -> str:
+    xml = re.sub(r"</w:p>|</a:p>|</text:p>", "\n", xml)
+    xml = re.sub(r"<[^>]+>", "", xml)
+    return re.sub(r"\n{3,}", "\n\n", xml).strip()
+
+
+def do_pdf(path, pages=None):
+    if not shutil.which("pdftotext"):
+        die("pdftotext not found (install poppler-utils) — cannot extract PDF text")
+    cmd = ["pdftotext", "-layout"]
+    if pages:
+        first, last = pages
+        cmd += ["-f", str(first), "-l", str(last)]
+    cmd += [path, "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    text = r.stdout
+    if len(text.strip()) < 20:
+        note("extraction produced almost no text — this PDF is very likely "
+             "scanned/image-based. Do NOT treat empty output as an empty "
+             "document; read it visually or OCR it.")
+        print("[EXTRACTION FAILED: no text layer — scanned or image-based PDF]")
+        return ""
+    return text
+
+
+def do_xlsx(path):
+    try:
+        import openpyxl  # type: ignore
+    except ImportError:
+        note("openpyxl not installed — falling back to raw shared-strings dump "
+             "(cell coordinates and formulas will be lost)")
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist() if n.endswith("sharedStrings.xml")]
+            if not names:
+                return "[no shared strings found]"
+            return strip_xml(z.read(names[0]).decode("utf-8", "replace"))
+
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    out = [f"# sheets: {wb.sheetnames}"]
+    for name in wb.sheetnames:
+        ws = wb[name]
+        out.append(f"\n## sheet: {name}  ({ws.max_row} rows x {ws.max_column} cols)")
+        for i, row in enumerate(ws.iter_rows(values_only=True), 1):
+            cells = ["" if c is None else str(c) for c in row]
+            if any(cells):
+                out.append(f"{i}\t" + "\t".join(cells))
+            if i >= 5000:
+                out.append(f"... truncated at 5000 rows of {ws.max_row}")
+                break
+    return "\n".join(out)
+
+
+def do_docx(path):
+    try:
+        import docx  # type: ignore
+        d = docx.Document(path)
+        parts = [p.text for p in d.paragraphs]
+        for t_i, table in enumerate(d.tables):
+            parts.append(f"\n[table {t_i + 1}]")
+            for row in table.rows:
+                parts.append("\t".join(c.text for c in row.cells))
+        return "\n".join(parts)
+    except ImportError:
+        note("python-docx not installed — using zip/XML fallback (tables and "
+             "formatting may be flattened)")
+        with zipfile.ZipFile(path) as z:
+            return strip_xml(z.read("word/document.xml").decode("utf-8", "replace"))
+
+
+def do_pptx(path):
+    with zipfile.ZipFile(path) as z:
+        slides = sorted(n for n in z.namelist()
+                        if re.match(r"ppt/slides/slide\d+\.xml$", n))
+        out = []
+        for s in slides:
+            out.append(f"\n## {os.path.basename(s)}")
+            out.append(strip_xml(z.read(s).decode("utf-8", "replace")))
+        return "\n".join(out)
+
+
+def do_ipynb(path):
+    nb = json.load(open(path, encoding="utf-8"))
+    out = []
+    stale = False
+    last_exec = 0
+    for i, cell in enumerate(nb.get("cells", [])):
+        ctype = cell.get("cell_type")
+        src = "".join(cell.get("source", []))
+        if ctype == "code":
+            ec = cell.get("execution_count")
+            if isinstance(ec, int):
+                if ec < last_exec:
+                    stale = True
+                last_exec = ec
+            out.append(f"\n## [{i}] code (exec {ec})\n{src}")
+            for o in cell.get("outputs", []):
+                txt = "".join(o.get("text", [])) or str(o.get("data", {}))[:500]
+                if txt.strip():
+                    out.append(f"   -> {txt.strip()[:1000]}")
+        else:
+            out.append(f"\n## [{i}] {ctype}\n{src}")
+    if stale:
+        note("execution counts are out of order — outputs are stale relative to "
+             "cell order; do not trust them as current results")
+    return "\n".join(out)
+
+
+def do_csv(path):
+    out = []
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        sample = f.read(8192)
+        f.seek(0)
+        try:
+            dialect = csvmod.Sniffer().sniff(sample)
+        except Exception:
+            dialect = csvmod.excel
+        for i, row in enumerate(csvmod.reader(f, dialect), 1):
+            out.append("\t".join(row))
+            if i >= 5000:
+                out.append("... truncated at 5000 rows")
+                break
+    return "\n".join(out)
+
+
+def do_text(path):
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return open(path, encoding=enc).read()
+        except UnicodeDecodeError:
+            continue
+    return "[binary or undecodable file]"
+
+
+def inventory(root):
+    rows = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for f in filenames:
+            p = os.path.join(dirpath, f)
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                continue
+            rows.append((os.path.splitext(f)[1].lower(), size,
+                         os.path.relpath(p, root)))
+    if not rows:
+        print("(no files)")
+        return
+    from collections import Counter
+    by_ext = Counter(r[0] for r in rows)
+    total = sum(r[1] for r in rows)
+    print(f"files: {len(rows)}   total: {total / 1e6:.1f} MB")
+    print("\nby type:")
+    for ext, n in by_ext.most_common():
+        sz = sum(r[1] for r in rows if r[0] == ext)
+        print(f"  {ext or '(none)':12s} {n:6d} files  {sz / 1e6:8.1f} MB")
+    print("\nlargest:")
+    for ext, size, rel in sorted(rows, key=lambda r: -r[1])[:20]:
+        print(f"  {size / 1e6:8.1f} MB  {rel}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        die(__doc__)
+
+    if args[0] == "--inventory":
+        if len(args) < 2:
+            die("--inventory needs a directory")
+        return inventory(args[1])
+
+    path = args[0]
+    if not os.path.isfile(path):
+        die(f"not a file: {path}")
+
+    pages = None
+    max_chars = MAX_CHARS
+    if "--pages" in args:
+        spec = args[args.index("--pages") + 1]
+        m = re.fullmatch(r"(\d+)-(\d+)", spec) or re.fullmatch(r"(\d+)", spec)
+        if not m:
+            die("--pages expects N or N-M")
+        g = m.groups()
+        pages = (int(g[0]), int(g[1] if len(g) > 1 else g[0]))
+    if "--max-chars" in args:
+        max_chars = int(args[args.index("--max-chars") + 1])
+
+    ext = os.path.splitext(path)[1].lower()
+    handlers = {
+        ".pdf": lambda p: do_pdf(p, pages),
+        ".xlsx": do_xlsx, ".xlsm": do_xlsx,
+        ".docx": do_docx,
+        ".pptx": do_pptx,
+        ".ipynb": do_ipynb,
+        ".csv": do_csv, ".tsv": do_csv,
+    }
+    handler = handlers.get(ext)
+    if handler is None:
+        if zipfile.is_zipfile(path):
+            note(f"unknown extension '{ext}' but file is a zip — listing members")
+            with zipfile.ZipFile(path) as z:
+                print("\n".join(z.namelist()[:200]))
+            return
+        handler = do_text
+
+    try:
+        text = handler(path)
+    except Exception as e:
+        die(f"extraction failed for {path}: {type(e).__name__}: {e}")
+
+    if len(text) > max_chars:
+        print(text[:max_chars])
+        note(f"output truncated at {max_chars} chars of {len(text)} — "
+             f"re-run with --max-chars or --pages to get the rest")
+    else:
+        print(text)
+
+
+if __name__ == "__main__":
+    main()

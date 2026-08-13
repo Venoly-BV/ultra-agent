@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""ultra-radius — blast-radius sweep for a symbol.
+
+Usage: ultra-radius <symbol> [path]
+
+Sweeps the reference classes that make a change safe to plan:
+  word     exact word-boundary references in source
+  string   the symbol inside quotes, across ALL file types (configs, DI,
+           fixtures, migrations, route tables)
+  compos   composite identifiers containing the symbol (FooBarBaz, foo_bar_x)
+  dynamic  dynamic-access idioms near the symbol's ecosystem (getattr,
+           importlib, reflection, require(var)) — presence caps static
+           confidence
+  tests    references under test trees, listed separately (blast radius AND
+           the future verification harness)
+
+Prefers ripgrep; falls back to a pure-python walk. Generated/vendored dirs
+are excluded and the exclusion is printed, so absence of hits there is a
+stated assumption rather than a silent one.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+    "target", "vendor", ".next", ".cache", "coverage", ".tox",
+}
+TEST_MARKERS = ("test", "tests", "spec", "__tests__", "testdata")
+DYNAMIC_PATTERNS = [
+    r"getattr\(", r"setattr\(", r"importlib", r"globals\(\)\[",
+    r"require\([^'\"]", r"Class\.forName", r"reflect\.", r"send\(:",
+    r"const_get", r"method_missing", r"__getattr__", r"eval\(",
+]
+CAP = 400  # print at most this many lines per class
+
+
+def have_rg():
+    return shutil.which("rg") is not None
+
+
+def rg(args, cwd):
+    excl = []
+    for d in SKIP_DIRS:
+        excl += ["--glob", f"!{d}/**"]
+    try:
+        r = subprocess.run(["rg", "--line-number", "--no-heading", *excl, *args],
+                           cwd=cwd, capture_output=True, text=True, timeout=60)
+        return r.stdout.splitlines()
+    except Exception:
+        return []
+
+
+def py_walk_grep(pattern, cwd):
+    rx = re.compile(pattern)
+    out = []
+    for dirpath, dirnames, filenames in os.walk(cwd):
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS and not d.startswith(".")]
+        for f in filenames:
+            p = os.path.join(dirpath, f)
+            try:
+                if os.path.getsize(p) > 2_000_000:
+                    continue
+                with open(p, encoding="utf-8", errors="ignore") as fh:
+                    for i, line in enumerate(fh, 1):
+                        if rx.search(line):
+                            rel = os.path.relpath(p, cwd)
+                            out.append(f"{rel}:{i}:{line.rstrip()[:160]}")
+            except OSError:
+                continue
+        if len(out) > 20000:
+            break
+    return out
+
+
+def sweep(pattern, cwd, rg_args=None):
+    if have_rg():
+        return rg(rg_args or ["-e", pattern], cwd)
+    return py_walk_grep(pattern, cwd)
+
+
+def is_test(path):
+    parts = path.lower().split(os.sep)
+    base = parts[-1]
+    return (any(m in parts[:-1] for m in TEST_MARKERS)
+            or base.startswith("test_") or ".test." in base
+            or ".spec." in base or base.endswith("_test.go"))
+
+
+def show(title, lines, cwd):
+    tests = [l for l in lines if is_test(l.split(":", 1)[0])]
+    src = [l for l in lines if l not in tests]
+    print(f"\n== {title}: {len(src)} source, {len(tests)} test ==")
+    by_dir = {}
+    for l in src:
+        d = os.path.dirname(l.split(":", 1)[0]) or "."
+        by_dir.setdefault(d, []).append(l)
+    shown = 0
+    for d in sorted(by_dir, key=lambda k: -len(by_dir[k])):
+        group = by_dir[d]
+        print(f"  [{d}] ({len(group)})")
+        for l in group[: max(3, CAP // max(len(by_dir), 1))]:
+            print(f"    {l[:200]}")
+            shown += 1
+            if shown >= CAP:
+                print(f"  ... capped at {CAP} lines; counts above are complete")
+                return tests
+        if len(group) > max(3, CAP // max(len(by_dir), 1)):
+            print(f"    ... +{len(group) - max(3, CAP // max(len(by_dir), 1))} more in this dir")
+    return tests
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    symbol = sys.argv[1]
+    cwd = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else ".")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", symbol):
+        sys.exit("ultra-radius: symbol must be an identifier (letters, digits, _, .)")
+    esc = re.escape(symbol)
+
+    print(f"ultra-radius: '{symbol}' under {cwd}")
+    print(f"excluded dirs: {', '.join(sorted(SKIP_DIRS))}")
+    if not have_rg():
+        print("(ripgrep not found — pure-python fallback, slower, 2MB/file cap)")
+
+    all_tests = []
+
+    # word-boundary references
+    lines = sweep(rf"\b{esc}\b", cwd, ["-w", "-e", esc])
+    all_tests += show("word-boundary references", lines, cwd)
+
+    # string references, all file types
+    lines = sweep(rf"[\"']{esc}[\"']", cwd, ["-e", rf"[\"']{esc}[\"']"])
+    all_tests += show("string references (configs/DI/fixtures)", lines, cwd)
+
+    # composite identifiers (exclude pure word hits)
+    lines = sweep(rf"\w{esc}|{esc}\w", cwd, ["-e", rf"\w{esc}|{esc}\w"])
+    all_tests += show("composite identifiers", lines, cwd)
+
+    # dynamic-access idioms (repo-wide presence check)
+    dyn_hits = []
+    for pat in DYNAMIC_PATTERNS:
+        found = sweep(pat, cwd, ["-e", pat])
+        if found:
+            dyn_hits.append(f"  {pat}  -> {len(found)} hit(s), e.g. {found[0][:120]}")
+    print(f"\n== dynamic-access idioms in repo: {len(dyn_hits)} pattern(s) present ==")
+    print("\n".join(dyn_hits[:20]) if dyn_hits
+          else "  none found — static sweep confidence is high")
+    if dyn_hits:
+        print("  NOTE: dynamic access exists in this codebase; static sweep is a floor, not a ceiling.")
+
+    # tests, gathered
+    uniq_tests = sorted(set(all_tests))
+    print(f"\n== test-tree references: {len(uniq_tests)} ==")
+    for l in uniq_tests[:100]:
+        print(f"  {l[:200]}")
+    if len(uniq_tests) > 100:
+        print(f"  ... +{len(uniq_tests) - 100} more")
+
+    print("\nReminder: serialized data (DB columns, wire formats, cache keys) and "
+          "external API surface are not greppable — check migrations/schemas/docs "
+          "by hand if this symbol names a persisted or public field.")
+
+
+if __name__ == "__main__":
+    main()

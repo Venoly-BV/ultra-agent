@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""ultra-graph — import/dependency graph for a repository.
+
+Usage:
+  ultra-graph [path]                 whole-repo structure report
+  ultra-graph --file <path>          who imports this file, and what it imports
+  ultra-graph [path] --cycles        circular dependencies only
+  ultra-graph [path] --json          machine-readable
+
+Answers the questions text search cannot:
+  - which files are hubs (high fan-in): changing them has the widest blast radius
+  - which are orphans (zero fan-in): dead code candidates, or undeclared entry points
+  - where the cycles are: the tangles that make changes propagate unpredictably
+  - which files are hardest to test (high fan-out)
+
+Resolves intra-repo imports for Python, JS/TS, Go, Rust, Java/Kotlin, C/C++,
+and Ruby. External packages are counted but not resolved.
+
+A static import graph is a floor, not a ceiling: runtime imports, dependency
+injection, and reflection create edges it cannot see. Treat a zero-fan-in
+verdict as a lead, never as proof that code is dead.
+
+Stdlib only.
+"""
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+
+SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "env", "__pycache__", "dist", "build",
+    "target", "vendor", ".next", ".nuxt", ".cache", ".tox", "coverage", ".idea",
+    ".vscode", ".terraform", "Pods", "DerivedData", ".gradle", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "bower_components",
+}
+SRC_EXT = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs",
+           ".java", ".kt", ".c", ".h", ".cc", ".cpp", ".hpp", ".rb"}
+JS_EXT = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+MAX_READ = 120_000
+
+PATTERNS = {
+    "py": [re.compile(r"^\s*from\s+([.\w]+)\s+import\s", re.M),
+           re.compile(r"^\s*import\s+([\w.]+)", re.M)],
+    "js": [re.compile(r"""^\s*import\s+(?:[\w*{},\s]+\s+from\s+)?['"]([^'"]+)['"]""", re.M),
+           re.compile(r"""\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)"""),
+           re.compile(r"""^\s*export\s+(?:\*|{[^}]*})\s+from\s+['"]([^'"]+)['"]""", re.M)],
+    "go": [re.compile(r'^\s*import\s+\(\s*((?:[^)]|\n)*?)\)', re.M),
+           re.compile(r'^\s*import\s+(?:\w+\s+)?"([^"]+)"', re.M)],
+    "rs": [re.compile(r"^\s*(?:pub\s+)?mod\s+(\w+)\s*;", re.M),
+           re.compile(r"^\s*(?:pub\s+)?use\s+(?:crate|self|super)::([\w:]+)", re.M)],
+    "java": [re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\s*;", re.M)],
+    "c": [re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.M)],
+    "rb": [re.compile(r"""^\s*require(?:_relative)?\s+['"]([^'"]+)['"]""", re.M)],
+}
+
+
+def lang_of(path):
+    e = os.path.splitext(path)[1].lower()
+    if e == ".py":
+        return "py"
+    if e in JS_EXT:
+        return "js"
+    if e == ".go":
+        return "go"
+    if e == ".rs":
+        return "rs"
+    if e in (".java", ".kt"):
+        return "java"
+    if e in (".c", ".h", ".cc", ".cpp", ".hpp"):
+        return "c"
+    if e == ".rb":
+        return "rb"
+    return None
+
+
+def walk(root):
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS and not d.startswith(".")]
+        for f in filenames:
+            if os.path.splitext(f)[1].lower() in SRC_EXT:
+                out.append(os.path.relpath(os.path.join(dirpath, f), root))
+        if len(out) > 60_000:
+            break
+    return out
+
+
+def read(p):
+    try:
+        if os.path.getsize(p) > 2_000_000:
+            return ""
+        with open(p, encoding="utf-8", errors="ignore") as f:
+            return f.read(MAX_READ)
+    except OSError:
+        return ""
+
+
+def raw_imports(text, lang):
+    found = []
+    for rx in PATTERNS.get(lang, []):
+        for m in rx.finditer(text):
+            val = m.group(1)
+            if lang == "go" and "\n" in val:  # grouped import block
+                for line in val.splitlines():
+                    q = re.search(r'"([^"]+)"', line)
+                    if q:
+                        found.append(q.group(1))
+            else:
+                found.append(val)
+    return found
+
+
+def build(root, files):
+    by_norm = {}          # normalized module key -> relative path
+    for f in files:
+        stem, _ = os.path.splitext(f)
+        by_norm.setdefault(stem.replace(os.sep, "/"), f)
+        by_norm.setdefault(os.path.basename(stem), f)
+        if os.path.basename(stem) in ("__init__", "index", "mod", "lib"):
+            by_norm.setdefault(os.path.dirname(f).replace(os.sep, "/"), f)
+
+    edges = defaultdict(set)      # file -> set(file)
+    external = Counter_ = defaultdict(int)
+    unresolved = defaultdict(int)
+
+    for f in files:
+        lang = lang_of(f)
+        if not lang:
+            continue
+        text = read(os.path.join(root, f))
+        if not text:
+            continue
+        here = os.path.dirname(f)
+        for spec in raw_imports(text, lang):
+            target = resolve(spec, f, here, lang, by_norm, files, root)
+            if target and target != f:
+                edges[f].add(target)
+            elif target is None:
+                key = spec.split("/")[0].split(".")[0]
+                if key and not key.startswith("."):
+                    external[key] += 1
+                else:
+                    unresolved[spec] += 1
+    return edges, external, unresolved
+
+
+def resolve(spec, src, here, lang, by_norm, files, root):
+    """Return a repo-relative path, or None when the import is external."""
+    if lang == "js":
+        if not spec.startswith("."):
+            return None
+        base = os.path.normpath(os.path.join(here, spec)).replace(os.sep, "/")
+        for cand in [base] + [base + e for e in JS_EXT] + \
+                    [f"{base}/index{e}" for e in JS_EXT]:
+            c = cand.replace("/", os.sep)
+            if c in files:
+                return c
+        return by_norm.get(base)
+
+    if lang == "py":
+        if spec.startswith("."):
+            up = len(spec) - len(spec.lstrip("."))
+            rest = spec.lstrip(".").replace(".", "/")
+            d = here
+            for _ in range(up - 1):
+                d = os.path.dirname(d)
+            base = os.path.normpath(os.path.join(d, rest)).replace(os.sep, "/") if rest \
+                else d.replace(os.sep, "/")
+            return by_norm.get(base) or by_norm.get(base + "/__init__")
+        path = spec.replace(".", "/")
+        return by_norm.get(path) or by_norm.get(path + "/__init__")
+
+    if lang == "java":
+        return by_norm.get(spec.replace(".", "/")) or by_norm.get(spec.split(".")[-1])
+
+    if lang == "c":
+        base = os.path.normpath(os.path.join(here, spec)).replace(os.sep, "/")
+        cand = base.replace("/", os.sep)
+        if cand in files:
+            return cand
+        return by_norm.get(os.path.splitext(spec)[0]) or \
+            by_norm.get(os.path.splitext(os.path.basename(spec))[0])
+
+    if lang == "rs":
+        first = spec.split("::")[0]
+        for cand in (f"{here}/{first}".lstrip("/"), f"{here}/{first}/mod".lstrip("/"),
+                     f"src/{first}", f"src/{first}/mod"):
+            hit = by_norm.get(cand.replace(os.sep, "/"))
+            if hit:
+                return hit
+        return by_norm.get(first)
+
+    if lang == "go":
+        tail = spec.rstrip("/").split("/")[-1]
+        hit = by_norm.get(spec) or by_norm.get(tail)
+        if hit:
+            return hit
+        for f in files:
+            if os.path.dirname(f).replace(os.sep, "/").endswith("/" + tail):
+                return f
+        return None
+
+    if lang == "rb":
+        base = os.path.normpath(os.path.join(here, spec)).replace(os.sep, "/")
+        return by_norm.get(base) or by_norm.get(spec) or by_norm.get(os.path.basename(spec))
+    return None
+
+
+def find_cycles(edges, limit=12):
+    """Iterative DFS; returns example cycles as path lists."""
+    cycles, seen_sets = [], set()
+    color = {}
+    for start in list(edges):
+        if color.get(start):
+            continue
+        stack = [(start, iter(sorted(edges.get(start, ()))))]
+        path = [start]
+        color[start] = 1
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nxt in it:
+                if color.get(nxt) == 1:                     # back edge -> cycle
+                    if nxt in path:
+                        cyc = path[path.index(nxt):] + [nxt]
+                        key = frozenset(cyc)
+                        if key not in seen_sets:
+                            seen_sets.add(key)
+                            cycles.append(cyc)
+                    if len(cycles) >= limit:
+                        return cycles
+                elif not color.get(nxt):
+                    color[nxt] = 1
+                    path.append(nxt)
+                    stack.append((nxt, iter(sorted(edges.get(nxt, ())))))
+                    advanced = True
+                    break
+            if not advanced:
+                color[node] = 2
+                stack.pop()
+                if path:
+                    path.pop()
+    return cycles
+
+
+def main():
+    argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    as_json = "--json" in sys.argv
+    only_cycles = "--cycles" in sys.argv
+    focus = None
+    if "--file" in sys.argv:
+        i = sys.argv.index("--file")
+        if i + 1 >= len(sys.argv):
+            sys.exit("ultra-graph: --file needs a path")
+        focus = sys.argv[i + 1]
+        argv = [a for a in argv if a != focus]
+
+    root = os.path.abspath(argv[0] if argv else ".")
+    if not os.path.isdir(root):
+        sys.exit(f"ultra-graph: not a directory: {root}")
+
+    files = walk(root)
+    if not files:
+        print("ultra-graph: no source files found (checked "
+              f"{', '.join(sorted(SRC_EXT))})")
+        return
+
+    edges, external, unresolved = build(root, files)
+    inbound = defaultdict(set)
+    for src, dsts in edges.items():
+        for d in dsts:
+            inbound[d].add(src)
+
+    fan_in = sorted(((len(v), k) for k, v in inbound.items()), reverse=True)
+    fan_out = sorted(((len(v), k) for k, v in edges.items()), reverse=True)
+    connected = set(edges) | set(inbound)
+    orphans = [f for f in files if f not in inbound and lang_of(f)]
+    cycles = find_cycles(edges)
+
+    if focus:
+        rel = os.path.relpath(os.path.abspath(focus), root)
+        if rel not in files:
+            match = [f for f in files if f.endswith(focus)]
+            if not match:
+                sys.exit(f"ultra-graph: {focus} not found under {root}")
+            rel = match[0]
+        importers = sorted(inbound.get(rel, ()))
+        imports = sorted(edges.get(rel, ()))
+        if as_json:
+            print(json.dumps({"file": rel, "importedBy": importers,
+                              "imports": imports}, indent=2))
+            return
+        print(f"ultra-graph: {rel}\n")
+        print(f"== imported by ({len(importers)}) — these break if you change its interface ==")
+        print("\n".join(f"  {i}" for i in importers) or "  (nothing — orphan, or reached dynamically)")
+        print(f"\n== imports ({len(imports)}) ==")
+        print("\n".join(f"  {i}" for i in imports) or "  (nothing local)")
+        return
+
+    payload = {
+        "root": root,
+        "files": len(files),
+        "edges": sum(len(v) for v in edges.values()),
+        "hubs": [{"file": f, "fanIn": n} for n, f in fan_in[:20]],
+        "fanOut": [{"file": f, "fanOut": n} for n, f in fan_out[:15]],
+        "orphans": orphans[:60],
+        "orphanCount": len(orphans),
+        "cycles": [c for c in cycles],
+        "externalTop": sorted(external.items(), key=lambda kv: -kv[1])[:20],
+        "unresolvedCount": sum(unresolved.values()),
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return
+
+    if only_cycles:
+        print(f"== cycles ({len(cycles)}) ==")
+        for c in cycles:
+            print("  " + " -> ".join(c))
+        if not cycles:
+            print("  none found")
+        return
+
+    print(f"ultra-graph: {root}")
+    print(f"{len(files)} source files, {payload['edges']} intra-repo import edges, "
+          f"{len(connected)} connected")
+
+    print("\n== hubs (highest fan-in — widest blast radius) ==")
+    for n, f in fan_in[:12]:
+        print(f"  {n:4d} <- {f}")
+    if not fan_in:
+        print("  (no intra-repo imports resolved — this repo may not use file imports,")
+        print("   or its language is outside what this tool parses)")
+
+    print("\n== heaviest dependents (highest fan-out — hardest to test in isolation) ==")
+    for n, f in fan_out[:8]:
+        print(f"  {n:4d} -> {f}")
+
+    print(f"\n== cycles ({len(cycles)}) ==")
+    for c in cycles[:6]:
+        print("  " + " -> ".join(c))
+    if not cycles:
+        print("  none found")
+
+    print(f"\n== orphans: {len(orphans)} files nothing imports ==")
+    for f in orphans[:15]:
+        print(f"  {f}")
+    if len(orphans) > 15:
+        print(f"  ... +{len(orphans) - 15} more")
+    if orphans:
+        print("  NOTE: entry points, tests, and plugin-style code legitimately have")
+        print("  zero fan-in. Confirm with a text search before calling anything dead.")
+
+    if payload["externalTop"]:
+        print("\n== most-used external packages ==")
+        print("  " + "  ".join(f"{k}({v})" for k, v in payload["externalTop"][:12]))
+
+
+if __name__ == "__main__":
+    main()
